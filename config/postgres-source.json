@@ -1,0 +1,17 @@
+{
+  "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+  "tasks.max": "1",
+  "database.hostname": "postgres",
+  "database.port": "5432",
+  "database.user": "demo",
+  "database.password": "demo",
+  "database.dbname": "demo",
+  "topic.prefix": "demo",
+  "plugin.name": "pgoutput",
+  "slot.name": "iceberg_demo_slot",
+  "publication.autocreate.mode": "filtered",
+  "schema.include.list": "public",
+  "table.include.list": "public.orders",
+  "snapshot.mode": "initial",
+  "tombstones.on.delete": "false"
+}

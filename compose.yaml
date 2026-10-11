@@ -1,0 +1,237 @@
+services:
+  postgres:
+    image: postgres:16.6
+    environment:
+      POSTGRES_DB: demo
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d demo"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio-data-init:
+    image: alpine:3.21
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        if [ "$$(stat -c '%u' /data)" != "1000" ]; then
+          chown -R 1000:1000 /data;
+        fi
+    volumes:
+      - minio_data:/data
+    restart: "no"
+
+  kafka:
+    image: apache/kafka:3.9.0
+    depends_on:
+      kafka-data-init:
+        condition: service_completed_successfully
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: "1"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kafka-data-init:
+    image: alpine:3.21
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        if [ "$$(stat -c '%u' /data)" != "1000" ]; then
+          chown -R 1000:1000 /data;
+        fi
+    volumes:
+      - kafka_data:/data
+    restart: "no"
+
+  minio:
+    build:
+      context: .
+      dockerfile: Dockerfile.minio
+    image: cdc-demo-minio
+    depends_on:
+      minio-data-init:
+        condition: service_completed_successfully
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: demo
+      MINIO_ROOT_PASSWORD: demo-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  minio-init:
+    image: amazon/aws-cli:2.24.20
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        attempt=0;
+        until aws --endpoint-url http://minio:9000 s3api list-buckets >/dev/null 2>&1; do
+          attempt=$$((attempt + 1));
+          if [ "$$attempt" -ge 60 ]; then echo "MinIO did not become ready" >&2; exit 1; fi;
+          sleep 2;
+        done;
+        if ! aws --endpoint-url http://minio:9000 s3api head-bucket --bucket warehouse >/dev/null 2>&1; then
+          aws --endpoint-url http://minio:9000 s3api create-bucket --bucket warehouse;
+        fi
+    environment:
+      AWS_ACCESS_KEY_ID: demo
+      AWS_SECRET_ACCESS_KEY: demo-secret
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    restart: "no"
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: demo
+      AWS_SECRET_ACCESS_KEY: demo-secret
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_URI: jdbc:sqlite:/tmp/iceberg_catalog.db
+      CATALOG_JDBC_USER: iceberg
+      CATALOG_JDBC_PASSWORD: iceberg
+    ports:
+      - "8181:8181"
+    volumes:
+      - iceberg_catalog_data:/tmp
+
+  iceberg-rest-ready:
+    image: curlimages/curl:8.12.1
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        attempt=0;
+        until curl -fsS http://iceberg-rest:8181/v1/config >/dev/null; do
+          attempt=$$((attempt + 1));
+          if [ "$$attempt" -ge 60 ]; then echo "Iceberg REST catalog did not become ready" >&2; exit 1; fi;
+          sleep 2;
+        done;
+        echo "Iceberg REST catalog is ready."
+    restart: "no"
+
+  connect:
+    build:
+      context: .
+      dockerfile: Dockerfile.connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      iceberg-rest-ready:
+        condition: service_completed_successfully
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: "1"
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_FLUSH_INTERVAL_MS: "5000"
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect
+      CONNECT_PLUGIN_PATH: /kafka/connect
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "true"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "true"
+    ports:
+      - "8083:8083"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connectors >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  connect-init:
+    image: curlimages/curl:8.12.1
+    depends_on:
+      connect:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/config/register-connectors.sh"]
+    volumes:
+      - ./config:/config:ro
+    restart: "no"
+
+  generator:
+    image: postgres:16.6
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: demo
+      PGUSER: demo
+      PGPASSWORD: demo
+      GENERATOR_INTERVAL: "2"
+    entrypoint: ["/bin/sh", "/generator/generate.sh"]
+    volumes:
+      - ./generator:/generator:ro
+    restart: unless-stopped
+
+  trino:
+    image: trinodb/trino:475
+    depends_on:
+      iceberg-rest-ready:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+
+volumes:
+  kafka_data:
+  postgres_data:
+  minio_data:
+  iceberg_catalog_data:

@@ -1,0 +1,23 @@
+{
+  "connector.class": "org.apache.iceberg.connect.IcebergSinkConnector",
+  "tasks.max": "1",
+  "topics": "demo.public.orders",
+  "iceberg.tables": "demo.orders",
+  "iceberg.tables.auto-create-enabled": "true",
+  "iceberg.tables.evolve-schema-enabled": "true",
+  "iceberg.tables.default-id-columns": "id",
+  "iceberg.tables.auto-create-props.format-version": "2",
+  "iceberg.control.commit.interval-ms": "5000",
+  "iceberg.catalog.type": "rest",
+  "iceberg.catalog.uri": "http://iceberg-rest:8181",
+  "iceberg.catalog.warehouse": "s3://warehouse/",
+  "iceberg.catalog.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
+  "iceberg.catalog.s3.endpoint": "http://minio:9000",
+  "iceberg.catalog.s3.path-style-access": "true",
+  "iceberg.catalog.s3.access-key-id": "demo",
+  "iceberg.catalog.s3.secret-access-key": "demo-secret",
+  "iceberg.catalog.client.region": "us-east-1",
+  "transforms": "debezium",
+  "transforms.debezium.type": "org.apache.iceberg.connect.transforms.DebeziumTransform",
+  "transforms.debezium.cdc.target.pattern": "demo.{table}"
+}

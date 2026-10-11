@@ -1,0 +1,22 @@
+FROM gradle:8.12.1-jdk17 AS iceberg-build
+
+ARG ICEBERG_VERSION=1.9.2
+WORKDIR /src
+
+RUN git clone --depth 1 --branch "apache-iceberg-${ICEBERG_VERSION}" \
+    https://github.com/apache/iceberg.git .
+RUN ./gradlew --no-daemon -x test -x integrationTest \
+    :iceberg-kafka-connect:iceberg-kafka-connect-runtime:distZip
+
+FROM alpine:3.21 AS plugin-extract
+RUN apk add --no-cache unzip
+COPY --from=iceberg-build /src/kafka-connect/kafka-connect-runtime/build/distributions/ /tmp/iceberg-distributions/
+RUN set -eu; \
+    archive="$(find /tmp/iceberg-distributions -type f -name '*.zip' ! -name '*hive*' -print -quit)"; \
+    if [ -z "$archive" ]; then echo "Iceberg Kafka Connect distribution archive not found" >&2; exit 1; fi; \
+    mkdir -p /plugin /tmp/iceberg-connect; \
+    unzip -q "$archive" -d /tmp/iceberg-connect; \
+    find /tmp/iceberg-connect -type f -name '*.jar' -exec cp {} /plugin/ \;
+
+FROM quay.io/debezium/connect:3.0.8.Final
+COPY --from=plugin-extract /plugin/ /kafka/connect/iceberg/
